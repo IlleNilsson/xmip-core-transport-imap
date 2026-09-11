@@ -29,10 +29,12 @@ use std::time::Duration;
 
 pub use client::{Client, Login};
 pub use session::{Served, Session};
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, NoNativeClaim, ResourceClaim, Transport};
 
+#[derive(Clone)]
 pub struct ImapTransport {
     server: String,
     mailbox: String,
@@ -148,6 +150,64 @@ impl Transport for ImapTransport {
     }
 }
 
+impl ImapTransport {
+    /// Both ends on this machine: an ephemeral local port, an empty INBOX
+    /// at the far end, a probe login, the loopback timeout on every read.
+    /// The near end appends the payload as one message; the far end takes
+    /// what was appended.
+    #[must_use]
+    pub fn loopback() -> Self {
+        let login = Login {
+            user: "probe".to_string(),
+            password: "probe".to_string(),
+        };
+        Self::new("127.0.0.1:0", "INBOX", login).timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for the one client that appends one message.
+struct Listening {
+    transport: ImapTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut served = self
+            .transport
+            .accept_one(&self.listener, Vec::new())?
+            .serve()?;
+        match served.appended.len() {
+            1 => Ok(served.appended.remove(0)),
+            count => Err(protocol_error(format!(
+                "the client appended {count} messages, not one"
+            ))),
+        }
+    }
+}
+
+impl Loopback for ImapTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        Self::new(address, &self.mailbox, self.login.clone())
+            .timing_out_after(LOOPBACK_TIMEOUT)
+            .send(&self.mailbox, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +221,44 @@ mod tests {
 
     fn node() -> ImapTransport {
         ImapTransport::new("127.0.0.1:0", "INBOX", login()).timing_out_after(Duration::from_secs(2))
+    }
+
+    fn edges() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+        ]
+    }
+
+    #[test]
+    fn the_loopback_appends_one_message_and_takes_it() {
+        let message = b"Subject: y\n\n{3}";
+        let arrived = ImapTransport::loopback().round(message).expect("round");
+        assert_eq!(arrived.bytes, message);
+        assert!(arrived.origin_uri.starts_with("imap://127.0.0.1:"));
+        assert!(arrived.origin_uri.ends_with("/INBOX/1"));
+        let long = vec![0x2a; 100_000];
+        assert_eq!(
+            ImapTransport::loopback().round(&long).expect("long").bytes,
+            long
+        );
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let transport = ImapTransport::loopback();
+        assert!(transport.ceiling().is_none());
+        for (name, bytes) in edges() {
+            assert!(transport.refuses(&bytes).is_none(), "{name}");
+            let arrived = transport
+                .round(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(arrived.bytes, bytes, "{name}");
+        }
     }
 
     #[test]
