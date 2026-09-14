@@ -30,6 +30,7 @@ use std::time::Duration;
 pub use client::{Client, Login};
 pub use session::{Served, Session};
 use transport::error::{Result, protocol_error};
+use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, NoNativeClaim, ResourceClaim, Transport};
@@ -165,23 +166,9 @@ impl ImapTransport {
     }
 }
 
-/// A bound listener waiting for the one client that appends one message.
-struct Listening {
-    transport: ImapTransport,
-    listener: TcpListener,
-    address: String,
-}
-
-impl FarEnd for Listening {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let mut served = self
-            .transport
-            .accept_one(&self.listener, Vec::new())?
-            .serve()?;
+impl Accepting for ImapTransport {
+    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+        let mut served = self.accept_one(listener, Vec::new())?.serve()?;
         match served.appended.len() {
             1 => Ok(served.appended.remove(0)),
             count => Err(protocol_error(format!(
@@ -194,11 +181,7 @@ impl FarEnd for Listening {
 impl Loopback for ImapTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening {
-            transport: self.clone(),
-            listener,
-            address,
-        }))
+        Ok(Box::new(Listening::new(self.clone(), listener, address)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
@@ -211,6 +194,7 @@ impl Loopback for ImapTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::edge_payloads;
 
     fn login() -> Login {
         Login {
@@ -221,17 +205,6 @@ mod tests {
 
     fn node() -> ImapTransport {
         ImapTransport::new("127.0.0.1:0", "INBOX", login()).timing_out_after(Duration::from_secs(2))
-    }
-
-    fn edges() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-        ]
     }
 
     #[test]
@@ -252,7 +225,7 @@ mod tests {
     fn the_loopback_returns_the_edge_payloads_whole() {
         let transport = ImapTransport::loopback();
         assert!(transport.ceiling().is_none());
-        for (name, bytes) in edges() {
+        for (name, bytes) in edge_payloads() {
             assert!(transport.refuses(&bytes).is_none(), "{name}");
             let arrived = transport
                 .round(&bytes)
