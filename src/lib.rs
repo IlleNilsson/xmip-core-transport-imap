@@ -29,7 +29,8 @@ use std::time::Duration;
 
 pub use client::{Client, Login};
 pub use session::{Served, Session};
-use transport::error::{Result, protocol_error};
+use transport::arrived::one_arrival;
+use transport::error::Result;
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
@@ -167,21 +168,15 @@ impl ImapTransport {
 }
 
 impl Accepting for ImapTransport {
-    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
-        let mut served = self.accept_one(listener, Vec::new())?.serve()?;
-        match served.appended.len() {
-            1 => Ok(served.appended.remove(0)),
-            count => Err(protocol_error(format!(
-                "the client appended {count} messages, not one"
-            ))),
-        }
+    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+        let served = self.accept_one(listener, Vec::new())?.serve()?;
+        one_arrival(served.appended, "the client appended")
     }
 }
 
 impl Loopback for ImapTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening::new(self.clone(), listener, address)))
+        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
