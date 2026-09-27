@@ -34,7 +34,12 @@ use transport::error::Result;
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, NoNativeClaim, ResourceClaim, Transport};
+use transport::{Arrived, Configured, Directions, NoNativeClaim, ResourceClaim, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// Whether a receive deletes each message once it is a Stream, unless a
+/// Location says.
+pub const DELETE_AFTER_FETCH: bool = true;
 
 #[derive(Clone)]
 pub struct ImapTransport {
@@ -53,7 +58,7 @@ impl ImapTransport {
             server: server.into(),
             mailbox: mailbox.to_string(),
             login,
-            delete_after_fetch: true,
+            delete_after_fetch: DELETE_AFTER_FETCH,
             timeout: None,
         }
     }
@@ -152,6 +157,62 @@ impl Transport for ImapTransport {
     }
 }
 
+impl Configured for ImapTransport {
+    /// The address is the server's host and port: where a Location logs in.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "mailbox",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The mailbox a Location collects from, or appends to unless the \
+                          target names another.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "user",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The user a Location logs in as.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "delete_after_fetch",
+                kind: Kind::Boolean,
+                presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_FETCH)),
+                meaning: "Whether a receive deletes each message once it is a Stream.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-response is waited on; unbounded \
+                          when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    /// The password comes through the Location's credentials, never a
+    /// setting; the login is built without it.
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let login = Login {
+            user: settings.text("user").to_string(),
+            password: String::new(),
+        };
+        let mut transport = Self::new(address, settings.text("mailbox"), login);
+        if settings.optional_boolean("delete_after_fetch") == Some(false) {
+            transport = transport.leaving_mail();
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl ImapTransport {
     /// Both ends on this machine: an ephemeral local port, an empty INBOX
     /// at the far end, a probe login, the loopback timeout on every read.
@@ -196,6 +257,31 @@ mod tests {
             user: "orders".into(),
             password: "se\"cret".into(),
         }
+    }
+
+    #[test]
+    fn imap_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(ImapTransport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [
+            ("mailbox".to_string(), Given::Text("INBOX".to_string())),
+            ("user".to_string(), Given::Text("orders".to_string())),
+            ("delete_after_fetch".to_string(), Given::Boolean(false)),
+        ];
+        let built =
+            ImapTransport::open("mail.example:143", Applies::Receive, &given).expect("built");
+        assert_eq!(built.mailbox, "INBOX");
+        assert_eq!(built.login.user, "orders");
+        assert!(
+            built.login.password.is_empty(),
+            "the password is the credentials'"
+        );
+        assert!(!built.delete_after_fetch);
+        let Err(refused) = ImapTransport::open("mail.example:143", Applies::Send, &given[..1])
+        else {
+            panic!("user is required");
+        };
+        assert!(refused.message.contains("\"user\""), "{}", refused.message);
     }
 
     fn node() -> ImapTransport {
