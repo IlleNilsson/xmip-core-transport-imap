@@ -6,18 +6,13 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use transport::error::{Result, classify, protocol_error};
-use transport::socket;
+use transport::pool::{Pooled, alive};
+use transport::{Login, socket};
 
 use crate::wire::{quoted, read, until_tagged};
 
-/// What a Location presents when it logs in.
-#[derive(Clone, Debug, Default)]
-pub struct Login {
-    pub user: String,
-    pub password: String,
-}
-
-/// One authenticated session.
+/// One authenticated session, kept between appends while the server keeps
+/// it open.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -165,5 +160,13 @@ impl Client {
         self.writer
             .flush()
             .map_err(|e| classify("flushing a command", &e))
+    }
+}
+
+impl Pooled for Client {
+    /// While the server has not closed the connection — an autologout
+    /// after a long idle closes it.
+    fn usable(&mut self) -> bool {
+        alive(&self.writer)
     }
 }

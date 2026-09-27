@@ -64,9 +64,28 @@ impl Session {
     /// # Errors
     /// Where the connection broke mid-command.
     pub fn serve(mut self) -> Result<Served> {
+        self.serve_until(false)?;
+        Ok(self.finish())
+    }
+
+    /// Serve the client until it appends a message, and that message:
+    /// what a depositor that keeps its session between messages is served
+    /// with. `None` where it logged out or dropped first.
+    ///
+    /// # Errors
+    /// Where the connection broke mid-command.
+    pub fn next_append(&mut self) -> Result<Option<Arrived>> {
+        let before = self.appended.len();
+        self.serve_until(true)?;
+        Ok(self.appended.get(before).cloned())
+    }
+
+    /// Serve commands until the client logs out or drops, or — where
+    /// `one_append` — has appended one message.
+    fn serve_until(&mut self, one_append: bool) -> Result<()> {
         loop {
             let Some(mut line) = read::line(&mut self.reader)? else {
-                return Ok(self.finish());
+                return Ok(());
             };
             // A command argument sent as a literal — a password with a quote
             // in it — is asked for with `+` and read in. APPEND aside: its
@@ -141,11 +160,16 @@ impl Session {
                     self.mailbox = kept;
                     self.ok(&tag, "expunged")?;
                 }
-                "APPEND" => self.append(&tag, &argument)?,
+                "APPEND" => {
+                    self.append(&tag, &argument)?;
+                    if one_append {
+                        return Ok(());
+                    }
+                }
                 "LOGOUT" => {
                     self.write(b"* BYE\r\n")?;
                     self.ok(&tag, "bye")?;
-                    return Ok(self.finish());
+                    return Ok(());
                 }
                 _ => self.write(format!("{tag} BAD unknown command\r\n").as_bytes())?,
             }
