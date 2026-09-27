@@ -6,13 +6,15 @@
 //! `APPEND`, `NOOP`, `CAPABILITY`, `LOGOUT` — the commands a collector and a
 //! depositor use, and no folder tree, no IDLE, no search grammar beyond ALL.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use transport::Arrived;
-use transport::error::{Result, classify};
-use transport::socket;
+use net::{MAX_BODY, read};
+use transport::error::{Result, classify, protocol_error};
+use transport::{Arrived, ceiling, socket};
+
+use crate::wire;
 
 /// What the client did, as [`Session::serve`] reports it at the end.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -63,34 +65,25 @@ impl Session {
     /// Where the connection broke mid-command.
     pub fn serve(mut self) -> Result<Served> {
         loop {
-            let mut line = String::new();
-            let read = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| classify("reading a command", &e))?;
-            if read == 0 {
+            let Some(mut line) = read::line(&mut self.reader)? else {
                 return Ok(self.finish());
-            }
-            let mut line = line.trim_end_matches(['\r', '\n']).to_string();
+            };
             // A command argument sent as a literal — a password with a quote
             // in it — is asked for with `+` and read in. APPEND aside: its
             // literal is the message, read where APPEND is served.
             while !line.to_ascii_uppercase().contains(" APPEND ")
-                && let Some(length) = literal_length(&line)
+                && let Some(length) = wire::literal_length(&line)?
             {
+                ceiling::within(line.len() + length, MAX_BODY, "Xmip reads in one command")?;
                 self.write(b"+ go ahead\r\n")?;
-                let mut bytes = vec![0u8; length];
-                self.reader
-                    .read_exact(&mut bytes)
-                    .map_err(|e| classify("reading a literal", &e))?;
-                let mut rest = String::new();
-                self.reader
-                    .read_line(&mut rest)
-                    .map_err(|e| classify("reading after a literal", &e))?;
+                let bytes = wire::read_literal(&mut self.reader, length)?;
+                let argument = String::from_utf8(bytes)
+                    .map_err(|_| protocol_error("a literal argument that is not UTF-8"))?;
+                let rest = wire::line(&mut self.reader)?;
                 let open = line.rfind('{').unwrap_or(line.len());
                 line.truncate(open);
-                line.push_str(&String::from_utf8_lossy(&bytes));
-                line.push_str(rest.trim_end_matches(['\r', '\n']));
+                line.push_str(&argument);
+                line.push_str(&rest);
             }
             let mut words = line.splitn(3, ' ');
             let tag = words.next().unwrap_or("*").to_string();
@@ -160,22 +153,12 @@ impl Session {
     }
 
     fn append(&mut self, tag: &str, argument: &str) -> Result<()> {
-        let Some(length) = argument
-            .rsplit_once('{')
-            .and_then(|(_, rest)| rest.strip_suffix('}'))
-            .and_then(|n| n.parse::<usize>().ok())
-        else {
+        let Some(length) = wire::literal_length(argument)? else {
             return self.no(tag, "append needs a literal");
         };
         self.write(b"+ go ahead\r\n")?;
-        let mut message = vec![0u8; length];
-        self.reader
-            .read_exact(&mut message)
-            .map_err(|e| classify("reading the appended message", &e))?;
-        let mut trailing = String::new();
-        self.reader
-            .read_line(&mut trailing)
-            .map_err(|e| classify("reading after the literal", &e))?;
+        let message = wire::read_literal(&mut self.reader, length)?;
+        wire::line(&mut self.reader)?;
         self.mailbox.push(message.clone());
         self.deleted.push(false);
         let origin = format!("imap://{}/INBOX/{}", self.peer, self.mailbox.len());
@@ -211,10 +194,4 @@ impl Session {
             .flush()
             .map_err(|e| classify("flushing a response", &e))
     }
-}
-
-/// The `n` of a `{n}` a line ends with.
-fn literal_length(line: &str) -> Option<usize> {
-    let open = line.rfind('{')?;
-    line[open + 1..].strip_suffix('}')?.parse().ok()
 }

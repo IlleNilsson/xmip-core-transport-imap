@@ -3,6 +3,8 @@
 
 use std::io::BufRead;
 
+use net::{MAX_BODY, read};
+use transport::ceiling;
 use transport::error::{Result, TransportError, classify, protocol_error};
 
 /// One response line, its literal (if the line announced one) read in.
@@ -38,19 +40,13 @@ impl Response {
 /// then the rest of the line, which is appended to `text`.
 ///
 /// # Errors
-/// A closed connection, or a literal that runs past the end.
+/// A closed connection, a literal over `net::MAX_BODY`, or one that runs
+/// past the end.
 pub fn read(reader: &mut impl BufRead) -> Result<Response> {
     let mut line = line(reader)?;
     let mut literal = None;
-    if let Some(open) = line.rfind('{')
-        && line.ends_with('}')
-        && let Ok(length) = line[open + 1..line.len() - 1].parse::<usize>()
-    {
-        let mut bytes = vec![0u8; length];
-        reader
-            .read_exact(&mut bytes)
-            .map_err(|e| classify("reading a literal", &e))?;
-        literal = Some(bytes);
+    if let Some(length) = literal_length(&line)? {
+        literal = Some(read_literal(reader, length)?);
         line.push_str(&self::line(reader)?);
     }
     let (tag, text) = line.split_once(' ').unwrap_or((line.as_str(), ""));
@@ -61,16 +57,40 @@ pub fn read(reader: &mut impl BufRead) -> Result<Response> {
     })
 }
 
-fn line(reader: &mut impl BufRead) -> Result<String> {
-    let mut raw = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut raw)
-        .map_err(|e| classify("reading a response", &e))?;
-    if read == 0 {
-        return Err(protocol_error("the peer closed the connection"));
-    }
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    Ok(text.trim_end_matches(['\r', '\n']).to_string())
+/// One line, its line ending off (`net::read::line`).
+///
+/// # Errors
+/// A closed connection, or a line over `net::read::MAX_LINE` or not UTF-8.
+pub fn line(reader: &mut impl BufRead) -> Result<String> {
+    read::line(reader)?.ok_or_else(|| protocol_error("the peer closed the connection"))
+}
+
+/// The `n` of the `{n}` a line ends with, where it announces a literal.
+///
+/// # Errors
+/// An `n` over `net::MAX_BODY`: refused before anything is allocated for it.
+pub fn literal_length(line: &str) -> Result<Option<usize>> {
+    let Some(length) = line
+        .rsplit_once('{')
+        .and_then(|(_, rest)| rest.strip_suffix('}'))
+        .and_then(|digits| digits.parse::<usize>().ok())
+    else {
+        return Ok(None);
+    };
+    ceiling::within(length, MAX_BODY, "Xmip reads in one literal")?;
+    Ok(Some(length))
+}
+
+/// The `length` bytes of a literal [`literal_length`] announced.
+///
+/// # Errors
+/// A connection that broke off inside it.
+pub fn read_literal(reader: &mut impl BufRead, length: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; length];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|e| classify("reading a literal", &e))?;
+    Ok(bytes)
 }
 
 /// Read responses until the one tagged `tag`, handing each untagged one to
@@ -134,6 +154,8 @@ mod tests {
         let plus = read(&mut &b"+ go ahead\r\n"[..]).expect("continuation");
         assert!(plus.is_continuation());
         assert!(read(&mut &b"* 1 FETCH {99}\r\nshort"[..]).is_err());
+        let claimed = read(&mut &b"* 1 FETCH {18446744073709551615}\r\n"[..]);
+        assert!(claimed.expect_err("claimed").message.contains("over the"));
     }
 
     #[test]
