@@ -27,14 +27,15 @@ pub mod wire;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::{Client, Login};
+pub use client::Client;
 pub use session::{Served, Session};
-use transport::arrived::one_arrival;
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, NoNativeClaim, ResourceClaim, Transport};
+use transport::{
+    Arrived, Configured, Directions, Login, NoNativeClaim, Pool, ResourceClaim, Transport,
+};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// Whether a receive deletes each message once it is a Stream, unless a
@@ -48,6 +49,8 @@ pub struct ImapTransport {
     login: Login,
     delete_after_fetch: bool,
     timeout: Option<Duration>,
+    /// The sessions a send appends on, logged in once per server and kept.
+    depositors: Pool<Client>,
 }
 
 impl ImapTransport {
@@ -60,6 +63,7 @@ impl ImapTransport {
             login,
             delete_after_fetch: DELETE_AFTER_FETCH,
             timeout: None,
+            depositors: Pool::new(),
         }
     }
 
@@ -145,11 +149,15 @@ impl Transport for ImapTransport {
         Ok(arrived)
     }
 
+    /// APPEND on the session kept for the server, logged in on the first
+    /// send to it.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, mailbox) = self.resolve(target);
-        let mut client = Client::connect(server, &self.login, self.timeout)?;
-        client.append(mailbox, bytes)?;
-        client.logout()
+        self.depositors.exchange(
+            server,
+            || Client::connect(server, &self.login, self.timeout),
+            |client| client.append(mailbox, bytes),
+        )
     }
 
     fn claims(&self) -> Option<&dyn ResourceClaim> {
@@ -198,10 +206,7 @@ impl Configured for ImapTransport {
     /// The password comes through the Location's credentials, never a
     /// setting; the login is built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
-        let login = Login {
-            user: settings.text("user").to_string(),
-            password: String::new(),
-        };
+        let login = Login::new(settings.text("user"), "");
         let mut transport = Self::new(address, settings.text("mailbox"), login);
         if settings.optional_boolean("delete_after_fetch") == Some(false) {
             transport = transport.leaving_mail();
@@ -220,18 +225,18 @@ impl ImapTransport {
     /// what was appended.
     #[must_use]
     pub fn loopback() -> Self {
-        let login = Login {
-            user: "probe".to_string(),
-            password: "probe".to_string(),
-        };
-        Self::new("127.0.0.1:0", "INBOX", login).timing_out_after(LOOPBACK_TIMEOUT)
+        Self::new("127.0.0.1:0", "INBOX", Login::new("probe", "probe"))
+            .timing_out_after(LOOPBACK_TIMEOUT)
     }
 }
 
 impl Accepting for ImapTransport {
+    /// The one message the client appends; it keeps its session for the
+    /// next.
     fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
-        let served = self.accept_one(listener, Vec::new())?.serve()?;
-        one_arrival(served.appended, "the client appended")
+        self.accept_one(listener, Vec::new())?
+            .next_append()?
+            .ok_or_else(|| protocol_error("the client logged out without appending"))
     }
 }
 
@@ -253,10 +258,7 @@ mod tests {
     use transport::payload::edge_payloads;
 
     fn login() -> Login {
-        Login {
-            user: "orders".into(),
-            password: "se\"cret".into(),
-        }
+        Login::new("orders", "se\"cret")
     }
 
     #[test]
@@ -349,6 +351,42 @@ mod tests {
         assert_eq!(collected[0].bytes, mailbox[0]);
         assert_eq!(collected[1].bytes, mailbox[1]);
         assert!(collected[1].origin_uri.ends_with("/INBOX/2"));
+    }
+
+    #[test]
+    fn a_thousand_appends_log_in_once_and_a_session_the_server_closed_is_replaced() {
+        const SENDS: usize = 1000;
+        let far_end = node().timing_out_after(Duration::from_secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near =
+            ImapTransport::new(address, "INBOX", login()).timing_out_after(Duration::from_secs(5));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for n in 0..SENDS {
+                sending.send("INBOX", n.to_string().as_bytes())?;
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond an append.
+            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
+            sending.send("INBOX", b"after the close")
+        });
+        // One LOGIN for every append: one session accepted.
+        let mut session = far_end
+            .accept_one(&listener, Vec::new())
+            .expect("accepting");
+        for n in 0..SENDS {
+            let appended = session.next_append().expect("append").expect("one");
+            assert_eq!(appended.bytes, n.to_string().as_bytes());
+        }
+        drop(session);
+        let mut again = far_end
+            .accept_one(&listener, Vec::new())
+            .expect("a new session");
+        let last = again.next_append().expect("append").expect("one");
+        assert_eq!(last.bytes, b"after the close");
+        sender.join().expect("thread").expect("sending");
+        assert_eq!(near.depositors.opened(), 2);
     }
 
     #[test]
