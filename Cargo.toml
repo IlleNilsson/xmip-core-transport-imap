@@ -18,6 +18,9 @@ path = "src/lib.rs"
 # (repository-model.md). Standard library otherwise: IMAP is a tagged line
 # and a literal.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+# A line read under its ceiling (`net::read`), and the ceiling a literal's
+# announced length is held to (`net::MAX_BODY`).
+net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
