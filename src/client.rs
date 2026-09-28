@@ -11,12 +11,13 @@ use transport::{Login, socket};
 
 use crate::wire::{quoted, read, until_tagged};
 
-/// One authenticated session, kept between appends while the server keeps
-/// it open.
+/// One authenticated session, kept between appends and collections while
+/// the server keeps it open, with the mailbox it has selected.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     next_tag: u32,
+    selected: Option<String>,
 }
 
 impl Client {
@@ -32,6 +33,7 @@ impl Client {
             reader,
             writer,
             next_tag: 0,
+            selected: None,
         };
         let greeting = read(&mut client.reader)?;
         if !greeting.is_untagged() || greeting.status() == "BYE" {
@@ -48,12 +50,28 @@ impl Client {
     /// Where there is no such mailbox.
     pub fn select(&mut self, mailbox: &str) -> Result<u32> {
         let mut exists = 0;
+        // A SELECT that fails leaves no mailbox selected (RFC 9051 6.3.2).
+        self.selected = None;
         self.command(&format!("SELECT {}", quoted(mailbox)), "the select", |r| {
             if let Some((count, "EXISTS")) = r.text.split_once(' ') {
                 exists = count.parse().unwrap_or(0);
             }
         })?;
+        self.selected = Some(mailbox.to_string());
         Ok(exists)
+    }
+
+    /// Select `mailbox` where this session has not already: a session kept
+    /// between collections selects its mailbox once, and a search in it
+    /// sees what arrived since.
+    ///
+    /// # Errors
+    /// Where there is no such mailbox.
+    pub fn selecting(&mut self, mailbox: &str) -> Result<()> {
+        if self.selected.as_deref() != Some(mailbox) {
+            self.select(mailbox)?;
+        }
+        Ok(())
     }
 
     /// The sequence numbers `SEARCH ALL` returns in the selected mailbox.
@@ -127,14 +145,6 @@ impl Client {
         self.write(message)?;
         self.write(b"\r\n")?;
         until_tagged(&mut self.reader, &tag, "the append", |_| {}).map(|_| ())
-    }
-
-    /// Log out.
-    ///
-    /// # Errors
-    /// Where the connection was already gone.
-    pub fn logout(mut self) -> Result<()> {
-        self.command("LOGOUT", "the logout", |_| {}).map(|_| ())
     }
 
     fn command(

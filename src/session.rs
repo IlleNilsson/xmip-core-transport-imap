@@ -10,9 +10,10 @@ use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use net::ceiling;
 use net::{MAX_BODY, read};
 use transport::error::{Result, classify, protocol_error};
-use transport::{Arrived, ceiling, socket};
+use transport::{Arrived, socket};
 
 use crate::wire;
 

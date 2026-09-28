@@ -28,6 +28,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::Client;
+use net::Target;
 pub use session::{Served, Session};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
@@ -40,7 +41,7 @@ use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// Whether a receive deletes each message once it is a Stream, unless a
 /// Location says.
-pub const DELETE_AFTER_FETCH: bool = true;
+const DELETE_AFTER_FETCH: bool = true;
 
 #[derive(Clone)]
 pub struct ImapTransport {
@@ -49,8 +50,10 @@ pub struct ImapTransport {
     login: Login,
     delete_after_fetch: bool,
     timeout: Option<Duration>,
-    /// The sessions a send appends on, logged in once per server and kept.
-    depositors: Pool<Client>,
+    /// The sessions a send appends on and a receive collects on, logged in
+    /// once per server and kept; a collecting one keeps its mailbox
+    /// selected.
+    sessions: Pool<Client>,
 }
 
 impl ImapTransport {
@@ -63,7 +66,7 @@ impl ImapTransport {
             login,
             delete_after_fetch: DELETE_AFTER_FETCH,
             timeout: None,
-            depositors: Pool::new(),
+            sessions: Pool::new(),
         }
     }
 
@@ -105,11 +108,33 @@ impl ImapTransport {
         Session::accept(listener, mailbox, self.timeout)
     }
 
+    /// Every message in the mailbox on `client`, selected where it is not
+    /// yet, each deleted once fetched unless the transport was told to
+    /// leave them.
+    fn collect(&self, client: &mut Client) -> Result<Vec<Arrived>> {
+        client.selecting(&self.mailbox)?;
+        let mut arrived = Vec::new();
+        for number in client.search_all()? {
+            let bytes = client.fetch(number)?;
+            if self.delete_after_fetch {
+                client.delete(number)?;
+            }
+            arrived.push(Arrived::new(
+                format!("imap://{}/{}/{number}", self.server, self.mailbox),
+                bytes,
+            ));
+        }
+        if self.delete_after_fetch && !arrived.is_empty() {
+            client.expunge()?;
+        }
+        Ok(arrived)
+    }
+
     /// Where a target names the server and mailbox itself —
     /// `imap://host:143/INBOX` — or is a mailbox alone on this transport's
     /// server.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match socket::target("imap", target) {
+        match Target::under(&["imap"], target).map(|named| (named.authority(), named.path())) {
             Some((peer, "")) => (peer, &self.mailbox),
             Some(pair) => pair,
             None => (&self.server, target),
@@ -127,33 +152,21 @@ impl Transport for ImapTransport {
     }
 
     /// Every message in the mailbox, each deleted once fetched unless the
-    /// transport was told to leave them.
+    /// transport was told to leave them, on the session kept for the
+    /// server: logged in and the mailbox selected on the first receive.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        client.select(&self.mailbox)?;
-        let mut arrived = Vec::new();
-        for number in client.search_all()? {
-            let bytes = client.fetch(number)?;
-            if self.delete_after_fetch {
-                client.delete(number)?;
-            }
-            arrived.push(Arrived::new(
-                format!("imap://{}/{}/{number}", self.server, self.mailbox),
-                bytes,
-            ));
-        }
-        if self.delete_after_fetch && !arrived.is_empty() {
-            client.expunge()?;
-        }
-        client.logout()?;
-        Ok(arrived)
+        self.sessions.exchange(
+            self.server.as_str(),
+            || self.connect(),
+            |client| self.collect(client),
+        )
     }
 
     /// APPEND on the session kept for the server, logged in on the first
     /// send to it.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, mailbox) = self.resolve(target);
-        self.depositors.exchange(
+        self.sessions.exchange(
             server,
             || Client::connect(server, &self.login, self.timeout),
             |client| client.append(mailbox, bytes),
@@ -332,17 +345,13 @@ mod tests {
             Ok::<_, transport::TransportError>(collected)
         });
         let mailbox = vec![b"one\r\n".to_vec(), b"two {3}\r\nxyz".to_vec()];
+        // One server, so one session collects and appends: one login.
         let served = far_end
             .accept_one(&listener, mailbox.clone())
             .expect("accepting")
             .serve()
             .expect("serving");
-        assert!(served.mailbox.is_empty(), "expunged");
-        let served = far_end
-            .accept_one(&listener, Vec::new())
-            .expect("second")
-            .serve()
-            .expect("serving");
+        assert_eq!(served.mailbox.len(), 1, "the two collected expunged");
         assert_eq!(served.appended.len(), 1);
         assert_eq!(served.appended[0].bytes, b"Subject: filed\r\n\r\nbody\r\n");
         assert!(served.appended[0].origin_uri.ends_with("/INBOX/1"));
@@ -386,7 +395,46 @@ mod tests {
         let last = again.next_append().expect("append").expect("one");
         assert_eq!(last.bytes, b"after the close");
         sender.join().expect("thread").expect("sending");
-        assert_eq!(near.depositors.opened(), 2);
+        assert_eq!(near.sessions.opened(), 2);
+    }
+
+    #[test]
+    fn a_thousand_receives_log_in_once_and_a_session_the_server_closed_is_replaced() {
+        const RECEIVES: usize = 1000;
+        let far_end = node().timing_out_after(Duration::from_secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near =
+            ImapTransport::new(address, "INBOX", login()).timing_out_after(Duration::from_secs(5));
+        let (go, going) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for _ in 0..RECEIVES {
+                assert!(near.receive()?.is_empty());
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond a search.
+            assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
+            // An append on the same kept session says the searches are done.
+            near.send("INBOX", b"searched")?;
+            going.recv().expect("go");
+            Ok::<_, transport::TransportError>((near.receive()?, near.sessions.opened()))
+        });
+        let mut session = far_end
+            .accept_one(&listener, Vec::new())
+            .expect("accepting");
+        let marker = session.next_append().expect("served").expect("the append");
+        assert_eq!(marker.bytes, b"searched");
+        drop(session);
+        go.send(()).expect("went");
+        let served = far_end
+            .accept_one(&listener, Vec::new())
+            .expect("a new session")
+            .serve()
+            .expect("serving");
+        assert!(served.appended.is_empty());
+        let (arrived, opened) = receiver.join().expect("thread").expect("collected");
+        assert!(arrived.is_empty());
+        assert_eq!(opened, 2);
     }
 
     #[test]

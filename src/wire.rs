@@ -3,8 +3,8 @@
 
 use std::io::BufRead;
 
+use net::ceiling;
 use net::{MAX_BODY, read};
-use transport::ceiling;
 use transport::error::{Result, TransportError, classify, protocol_error};
 
 /// One response line, its literal (if the line announced one) read in.
