@@ -4,7 +4,7 @@
 //! appended to a mailbox. One message is one Stream, its sequence number
 //! in the mailbox kept beside it.
 //!
-//! IMAP is the mailbox that stays on the server: a partner's orders land in
+//! IMAP is the mailbox that stays on the server: a Party's orders land in
 //! a shared box and more than one thing reads it. A Receive Location logs
 //! in, selects the mailbox, searches, fetches every message whole and flags
 //! what it fetched deleted, expunging at the end; a Send Location appends a
