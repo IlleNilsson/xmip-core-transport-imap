@@ -6,8 +6,10 @@
 //!
 //! IMAP is the mailbox that stays on the server: a Party's orders land in
 //! a shared box and more than one thing reads it. A Receive Location logs
-//! in, selects the mailbox, searches, fetches every message whole and flags
-//! what it fetched deleted, expunging at the end; a Send Location appends a
+//! in, selects the mailbox, searches, and hands each message back unread:
+//! fetched whole with `BODY.PEEK[]` when the runtime first reads it, flagged
+//! deleted only when its receive cycle accepted it, and expunged once every
+//! message of the receive has its verdict ([`connection`]); a Send Location appends a
 //! message to a mailbox, which is how a Journey files what it concluded
 //! where people read it. Either may instead accept clients directly through
 //! [`Session`], one client's worth of server over one mailbox.
@@ -18,9 +20,11 @@
 //! keeps that honest. RFC 3501; IDLE, folders beyond the one selected, and
 //! TLS are the next layers.
 //!
-//! The origin URI carries what the server knew: `imap://server/INBOX/3`.
+//! The origin URI carries what the server knew, the message's UID last:
+//! `imap://server/INBOX/3`.
 
 pub mod client;
+pub mod connection;
 pub mod session;
 pub mod wire;
 
@@ -28,19 +32,20 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::Client;
+pub use connection::Connection;
 use net::Target;
 pub use session::{Served, Session};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
+use transport::taken::Taken;
 use transport::{
     Arrived, Configured, Directions, Login, NoNativeClaim, Pool, ResourceClaim, Transport,
 };
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
-/// Whether a receive deletes each message once it is a Stream, unless a
-/// Location says.
+/// Whether an accepted message is deleted, unless a Location says.
 const DELETE_AFTER_FETCH: bool = true;
 
 #[derive(Clone)]
@@ -51,9 +56,9 @@ pub struct ImapTransport {
     delete_after_fetch: bool,
     timeout: Option<Duration>,
     /// The sessions a send appends on and a receive collects on, logged in
-    /// once per server and kept; a collecting one keeps its mailbox
-    /// selected.
-    sessions: Pool<Client>,
+    /// once per server and kept, shared with what a receive handed back; a
+    /// collecting one keeps its mailbox selected.
+    sessions: Pool<Connection>,
 }
 
 impl ImapTransport {
@@ -70,7 +75,7 @@ impl ImapTransport {
         }
     }
 
-    /// Leave fetched messages in the mailbox rather than deleting them.
+    /// Leave accepted messages in the mailbox rather than deleting them.
     #[must_use]
     pub const fn leaving_mail(mut self) -> Self {
         self.delete_after_fetch = false;
@@ -108,28 +113,6 @@ impl ImapTransport {
         Session::accept(listener, mailbox, self.timeout)
     }
 
-    /// Every message in the mailbox on `client`, selected where it is not
-    /// yet, each deleted once fetched unless the transport was told to
-    /// leave them.
-    fn collect(&self, client: &mut Client) -> Result<Vec<Arrived>> {
-        client.selecting(&self.mailbox)?;
-        let mut arrived = Vec::new();
-        for number in client.search_all()? {
-            let bytes = client.fetch(number)?;
-            if self.delete_after_fetch {
-                client.delete(number)?;
-            }
-            arrived.push(Arrived::new(
-                format!("imap://{}/{}/{number}", self.server, self.mailbox),
-                bytes,
-            ));
-        }
-        if self.delete_after_fetch && !arrived.is_empty() {
-            client.expunge()?;
-        }
-        Ok(arrived)
-    }
-
     /// Where a target names the server and mailbox itself —
     /// `imap://host:143/INBOX` — or is a mailbox alone on this transport's
     /// server.
@@ -151,14 +134,30 @@ impl Transport for ImapTransport {
         Directions::BOTH
     }
 
-    /// Every message in the mailbox, each deleted once fetched unless the
-    /// transport was told to leave them, on the session kept for the
-    /// server: logged in and the mailbox selected on the first receive.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("a receive searches again what is not yet told")
+    }
+
+    /// Every message in the mailbox not flagged deleted, searched on the
+    /// session kept for the server — logged in and the mailbox selected on
+    /// the first receive — and handed back unread: each is fetched whole
+    /// with `BODY.PEEK[]` when the runtime first reads it; `Accepted` and
+    /// `Refused` flag it deleted unless the transport was told to leave
+    /// mail, `Failed` leaves it as it was, and the receive's flagged
+    /// messages are expunged once every one has its verdict
+    /// ([`connection`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.sessions.exchange(
             self.server.as_str(),
-            || self.connect(),
-            |client| self.collect(client),
+            || self.connect().map(Connection::new),
+            |connection| {
+                let uids = connection.with(|client| {
+                    client.selecting(&self.mailbox)?;
+                    client.search_undeleted()
+                })?;
+                let origin = |uid| format!("imap://{}/{}/{uid}", self.server, self.mailbox);
+                Ok(connection.arrivals(uids, origin, self.delete_after_fetch))
+            },
         )
     }
 
@@ -168,8 +167,8 @@ impl Transport for ImapTransport {
         let (server, mailbox) = self.resolve(target);
         self.sessions.exchange(
             server,
-            || Client::connect(server, &self.login, self.timeout),
-            |client| client.append(mailbox, bytes),
+            || Client::connect(server, &self.login, self.timeout).map(Connection::new),
+            |connection| connection.with(|client| client.append(mailbox, bytes)),
         )
     }
 
@@ -202,7 +201,7 @@ impl Configured for ImapTransport {
                 name: "delete_after_fetch",
                 kind: Kind::Boolean,
                 presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_FETCH)),
-                meaning: "Whether a receive deletes each message once it is a Stream.",
+                meaning: "Whether a message is deleted once its receive cycle accepted it.",
                 applies: Applies::Receive,
             },
             Setting {
@@ -246,7 +245,7 @@ impl ImapTransport {
 impl Accepting for ImapTransport {
     /// The one message the client appends; it keeps its session for the
     /// next.
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         self.accept_one(listener, Vec::new())?
             .next_append()?
             .ok_or_else(|| protocol_error("the client logged out without appending"))
@@ -337,7 +336,11 @@ mod tests {
         let near = std::thread::spawn(move || {
             let near = ImapTransport::new(address.clone(), "INBOX", login())
                 .timing_out_after(Duration::from_secs(2));
-            let collected = near.receive()?;
+            let collected = near
+                .receive()?
+                .into_iter()
+                .map(Arrived::taken)
+                .collect::<Result<Vec<_>>>()?;
             near.send(
                 &format!("imap://{address}/Sent"),
                 b"Subject: filed\r\n\r\nbody\r\n",
@@ -360,6 +363,53 @@ mod tests {
         assert_eq!(collected[0].bytes, mailbox[0]);
         assert_eq!(collected[1].bytes, mailbox[1]);
         assert!(collected[1].origin_uri.ends_with("/INBOX/2"));
+    }
+
+    #[test]
+    fn a_failed_message_stays_and_a_refused_and_an_accepted_one_are_expunged() {
+        let far_end = node();
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = std::thread::spawn(move || {
+            let near = ImapTransport::new(address, "INBOX", login())
+                .timing_out_after(Duration::from_secs(2));
+            let mut first = near.receive()?;
+            assert_eq!(first.len(), 3);
+            assert!(first.iter().all(Arrived::defers));
+            // The first read and failed, the second refused, the third
+            // accepted.
+            let (_, mut body, acknowledgement) = first.remove(0).into_parts();
+            let mut read = Vec::new();
+            std::io::Read::read_to_end(&mut body, &mut read).expect("reading");
+            drop(body);
+            acknowledgement.acknowledge(transport::Verdict::Failed)?;
+            first.remove(0).refused(transport::Refusal::Unacceptable)?;
+            let accepted = first.remove(0).taken()?;
+            let again = transport::arrived::one_arrival(near.receive()?, "collected again")?;
+            let again = again.taken()?;
+            let after = near.receive()?.len();
+            Ok::<_, transport::TransportError>((read, accepted, again, after))
+        });
+        let mailbox = vec![
+            b"one\r\n".to_vec(),
+            b"two\r\n".to_vec(),
+            b"three\r\n".to_vec(),
+        ];
+        let served = far_end
+            .accept_one(&listener, mailbox)
+            .expect("accepting")
+            .serve()
+            .expect("serving");
+        let (read, accepted, again, after) = near.join().expect("thread").expect("collected");
+        assert_eq!(read, b"one\r\n");
+        assert_eq!(accepted.bytes, b"three\r\n");
+        assert!(accepted.origin_uri.ends_with("/INBOX/3"));
+        assert_eq!(
+            again.bytes, b"one\r\n",
+            "the failed message is collected again, the refused one not"
+        );
+        assert!(again.origin_uri.ends_with("/INBOX/1"), "by its UID");
+        assert_eq!(after, 0);
+        assert!(served.mailbox.is_empty(), "every one expunged");
     }
 
     #[test]
@@ -445,7 +495,10 @@ mod tests {
             ImapTransport::new(address, "INBOX", login())
                 .leaving_mail()
                 .timing_out_after(Duration::from_secs(2))
-                .receive()
+                .receive()?
+                .into_iter()
+                .map(Arrived::taken)
+                .collect::<Result<Vec<_>>>()
         });
         let served = far_end
             .accept_one(&listener, vec![b"kept".to_vec()])
@@ -453,7 +506,9 @@ mod tests {
             .serve()
             .expect("serving");
         assert_eq!(served.mailbox, vec![b"kept".to_vec()]);
-        assert_eq!(near.join().expect("thread").expect("collecting").len(), 1);
+        let collected = near.join().expect("thread").expect("collecting");
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].bytes, b"kept");
         assert!(far_end.claims().is_some());
     }
 

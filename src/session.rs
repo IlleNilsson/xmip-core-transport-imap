@@ -2,9 +2,11 @@
 //! what a Location that hands mail to an IMAP client directly runs.
 //!
 //! One mailbox, in memory, one client at a time. `LOGIN`, `SELECT`,
-//! `SEARCH ALL`, `FETCH n BODY[]`, `STORE +FLAGS (\Deleted)`, `EXPUNGE`,
-//! `APPEND`, `NOOP`, `CAPABILITY`, `LOGOUT` — the commands a collector and a
-//! depositor use, and no folder tree, no IDLE, no search grammar beyond ALL.
+//! `SEARCH`, `FETCH n BODY[]` (or `BODY.PEEK[]`), `STORE +FLAGS (\Deleted)`,
+//! each by sequence number or by `UID`, `EXPUNGE`, `APPEND`, `NOOP`,
+//! `CAPABILITY`, `LOGOUT` — the commands a collector and a depositor use,
+//! and no folder tree, no IDLE, no search grammar: every search answers the
+//! messages not flagged deleted.
 
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,7 +15,8 @@ use std::time::Duration;
 use net::ceiling;
 use net::{MAX_BODY, read};
 use transport::error::{Result, classify, protocol_error};
-use transport::{Arrived, socket};
+use transport::socket;
+use transport::taken::Taken;
 
 use crate::wire;
 
@@ -23,7 +26,7 @@ pub struct Served {
     /// What the mailbox holds after the session.
     pub mailbox: Vec<Vec<u8>>,
     /// What the client appended, in order.
-    pub appended: Vec<Arrived>,
+    pub appended: Vec<Taken>,
 }
 
 pub struct Session {
@@ -32,7 +35,9 @@ pub struct Session {
     peer: String,
     mailbox: Vec<Vec<u8>>,
     deleted: Vec<bool>,
-    appended: Vec<Arrived>,
+    /// Each message's UID, which an expunge does not renumber.
+    uids: Vec<u32>,
+    appended: Vec<Taken>,
 }
 
 impl Session {
@@ -48,12 +53,14 @@ impl Session {
         let (stream, peer) = socket::accept_tcp(listener, timeout)?;
         let (reader, writer) = socket::split(stream)?;
         let deleted = vec![false; mailbox.len()];
+        let uids = (1..=u32::try_from(mailbox.len()).unwrap_or(u32::MAX)).collect();
         let mut session = Self {
             reader,
             writer,
             peer: peer.to_string(),
             mailbox,
             deleted,
+            uids,
             appended: Vec::new(),
         };
         session.write(b"* OK xmip ready\r\n")?;
@@ -75,7 +82,7 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection broke mid-command.
-    pub fn next_append(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_append(&mut self) -> Result<Option<Taken>> {
         let before = self.appended.len();
         self.serve_until(true)?;
         Ok(self.appended.get(before).cloned())
@@ -107,8 +114,14 @@ impl Session {
             }
             let mut words = line.splitn(3, ' ');
             let tag = words.next().unwrap_or("*").to_string();
-            let verb = words.next().unwrap_or("").to_ascii_uppercase();
-            let argument = words.next().unwrap_or("").to_string();
+            let mut verb = words.next().unwrap_or("").to_ascii_uppercase();
+            let mut argument = words.next().unwrap_or("").to_string();
+            // `UID` names messages by UID rather than sequence number.
+            let by_uid = verb == "UID";
+            if by_uid {
+                let (inner, rest) = argument.split_once(' ').unwrap_or((&argument, ""));
+                (verb, argument) = (inner.to_ascii_uppercase(), rest.to_string());
+            }
             match verb.as_str() {
                 "CAPABILITY" => {
                     self.write(b"* CAPABILITY IMAP4rev1\r\n")?;
@@ -123,16 +136,19 @@ impl Session {
                 "SEARCH" => {
                     let numbers: Vec<String> = (1..=self.mailbox.len())
                         .filter(|n| !self.deleted[n - 1])
+                        .map(|n| if by_uid { self.uids[n - 1] as usize } else { n })
                         .map(|n| n.to_string())
                         .collect();
                     self.write(format!("* SEARCH {}\r\n", numbers.join(" ")).as_bytes())?;
                     self.ok(&tag, "search done")?;
                 }
-                "FETCH" => match self.number(&argument) {
+                "FETCH" => match self.number(&argument, by_uid) {
                     Some(n) => {
                         let body = self.mailbox[n - 1].clone();
+                        let uid = self.uids[n - 1];
                         self.write(
-                            format!("* {n} FETCH (BODY[] {{{}}}\r\n", body.len()).as_bytes(),
+                            format!("* {n} FETCH (UID {uid} BODY[] {{{}}}\r\n", body.len())
+                                .as_bytes(),
                         )?;
                         self.write(&body)?;
                         self.write(b")\r\n")?;
@@ -140,7 +156,7 @@ impl Session {
                     }
                     None => self.no(&tag, "no such message")?,
                 },
-                "STORE" => match self.number(&argument) {
+                "STORE" => match self.number(&argument, by_uid) {
                     Some(n) => {
                         if argument.contains("\\Deleted") {
                             self.deleted[n - 1] = true;
@@ -151,14 +167,16 @@ impl Session {
                 },
                 "EXPUNGE" => {
                     let deleted = std::mem::take(&mut self.deleted);
-                    let kept: Vec<Vec<u8>> = std::mem::take(&mut self.mailbox)
+                    let (kept, uids): (Vec<Vec<u8>>, Vec<u32>) = std::mem::take(&mut self.mailbox)
                         .into_iter()
+                        .zip(std::mem::take(&mut self.uids))
                         .zip(deleted)
                         .filter(|(_, gone)| !gone)
-                        .map(|(m, _)| m)
-                        .collect();
+                        .map(|(kept, _)| kept)
+                        .unzip();
                     self.deleted = vec![false; kept.len()];
                     self.mailbox = kept;
+                    self.uids = uids;
                     self.ok(&tag, "expunged")?;
                 }
                 "APPEND" => {
@@ -186,8 +204,10 @@ impl Session {
         wire::line(&mut self.reader)?;
         self.mailbox.push(message.clone());
         self.deleted.push(false);
+        let uid = self.uids.last().map_or(1, |last| last + 1);
+        self.uids.push(uid);
         let origin = format!("imap://{}/INBOX/{}", self.peer, self.mailbox.len());
-        self.appended.push(Arrived::new(origin, message));
+        self.appended.push(Taken::new(origin, message));
         self.ok(tag, "appended")
     }
 
@@ -198,8 +218,14 @@ impl Session {
         }
     }
 
-    fn number(&self, argument: &str) -> Option<usize> {
-        let n: usize = argument.split(' ').next()?.parse().ok()?;
+    /// The sequence number `argument` names first, by UID where `by_uid`.
+    fn number(&self, argument: &str, by_uid: bool) -> Option<usize> {
+        let named: u32 = argument.split(' ').next()?.parse().ok()?;
+        let n = if by_uid {
+            self.uids.iter().position(|uid| *uid == named)? + 1
+        } else {
+            usize::try_from(named).ok()?
+        };
         (n >= 1 && n <= self.mailbox.len() && !self.deleted[n - 1]).then_some(n)
     }
 
