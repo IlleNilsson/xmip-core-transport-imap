@@ -1,5 +1,6 @@
 //! The client's side of one IMAP session: log in, select, search, fetch,
-//! flag deleted, expunge, append, log out.
+//! flag deleted, expunge, append, log out. A message is named by its UID,
+//! which an expunge by another session does not renumber.
 
 use std::io::{BufReader, Write};
 use std::net::TcpStream;
@@ -74,30 +75,32 @@ impl Client {
         Ok(())
     }
 
-    /// The sequence numbers `SEARCH ALL` returns in the selected mailbox.
+    /// The UIDs `UID SEARCH UNDELETED` returns in the selected mailbox: a
+    /// message flagged deleted and not yet expunged is already taken.
     ///
     /// # Errors
     /// Where no mailbox is selected.
-    pub fn search_all(&mut self) -> Result<Vec<u32>> {
-        let mut numbers = Vec::new();
-        self.command("SEARCH ALL", "the search", |r| {
+    pub fn search_undeleted(&mut self) -> Result<Vec<u32>> {
+        let mut uids = Vec::new();
+        self.command("UID SEARCH UNDELETED", "the search", |r| {
             if let Some(rest) = r.text.strip_prefix("SEARCH") {
-                numbers.extend(
+                uids.extend(
                     rest.split_whitespace()
                         .filter_map(|n| n.parse::<u32>().ok()),
                 );
             }
         })?;
-        Ok(numbers)
+        Ok(uids)
     }
 
-    /// Message `number`, whole, as `FETCH BODY[]` returns it.
+    /// Message `uid`, whole, as `UID FETCH BODY.PEEK[]` returns it: the
+    /// peek leaves it unseen, so a refused message stays as it was.
     ///
     /// # Errors
     /// Where there is no such message or the body did not come.
-    pub fn fetch(&mut self, number: u32) -> Result<Vec<u8>> {
+    pub fn fetch(&mut self, uid: u32) -> Result<Vec<u8>> {
         let mut body = None;
-        self.command(&format!("FETCH {number} BODY[]"), "the fetch", |r| {
+        self.command(&format!("UID FETCH {uid} BODY.PEEK[]"), "the fetch", |r| {
             if r.text.contains("FETCH") && r.literal.is_some() {
                 body = r.literal;
             }
@@ -105,13 +108,13 @@ impl Client {
         body.ok_or_else(|| protocol_error("the fetch answered without a body"))
     }
 
-    /// Flag message `number` deleted.
+    /// Flag message `uid` deleted.
     ///
     /// # Errors
     /// Where there is no such message.
-    pub fn delete(&mut self, number: u32) -> Result<()> {
+    pub fn delete(&mut self, uid: u32) -> Result<()> {
         self.command(
-            &format!("STORE {number} +FLAGS (\\Deleted)"),
+            &format!("UID STORE {uid} +FLAGS (\\Deleted)"),
             "the delete",
             |_| {},
         )
