@@ -9,7 +9,9 @@
 //! in, selects the mailbox, searches, and hands each message back unread:
 //! fetched whole with `BODY.PEEK[]` when the runtime first reads it, flagged
 //! deleted only when its receive cycle accepted it, and expunged once every
-//! message of the receive has its verdict ([`connection`]); a Send Location appends a
+//! message of the receive has its verdict ([`connection`]). A refused
+//! message is left in the mailbox, and this Location does not collect it
+//! again while it lies there unchanged; a Send Location appends a
 //! message to a mailbox, which is how a Journey files what it concluded
 //! where people read it. Either may instead accept clients directly through
 //! [`Session`], one client's worth of server over one mailbox.
@@ -32,7 +34,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::Client;
-pub use connection::Connection;
+pub use connection::{Connection, RefusedMail};
 use net::Target;
 pub use session::{Served, Session};
 use transport::error::{Result, protocol_error};
@@ -59,6 +61,9 @@ pub struct ImapTransport {
     /// once per server and kept, shared with what a receive handed back; a
     /// collecting one keeps its mailbox selected.
     sessions: Pool<Connection>,
+    /// The messages refused and left in the mailbox, shared with the
+    /// acknowledgements a receive handed out.
+    refused: RefusedMail,
 }
 
 impl ImapTransport {
@@ -72,6 +77,7 @@ impl ImapTransport {
             delete_after_fetch: DELETE_AFTER_FETCH,
             timeout: None,
             sessions: Pool::new(),
+            refused: RefusedMail::default(),
         }
     }
 
@@ -141,10 +147,11 @@ impl Transport for ImapTransport {
     /// Every message in the mailbox not flagged deleted, searched on the
     /// session kept for the server — logged in and the mailbox selected on
     /// the first receive — and handed back unread: each is fetched whole
-    /// with `BODY.PEEK[]` when the runtime first reads it; `Accepted` and
-    /// `Refused` flag it deleted unless the transport was told to leave
-    /// mail, `Failed` leaves it as it was, and the receive's flagged
-    /// messages are expunged once every one has its verdict
+    /// with `BODY.PEEK[]` when the runtime first reads it; `Accepted` flags
+    /// it deleted unless the transport was told to leave mail, `Refused`
+    /// leaves it and this Location does not collect it again while it lies
+    /// there unchanged, `Failed` leaves it as it was, and the receive's
+    /// flagged messages are expunged once every one has its verdict
     /// ([`connection`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.sessions.exchange(
@@ -156,7 +163,8 @@ impl Transport for ImapTransport {
                     client.search_undeleted()
                 })?;
                 let origin = |uid| format!("imap://{}/{}/{uid}", self.server, self.mailbox);
-                Ok(connection.arrivals(uids, origin, self.delete_after_fetch))
+                let delete = self.delete_after_fetch;
+                Ok(connection.arrivals(uids, origin, delete, &self.refused))
             },
         )
     }
@@ -366,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_message_stays_and_a_refused_and_an_accepted_one_are_expunged() {
+    fn a_failed_and_a_refused_message_stay_an_accepted_one_is_expunged() {
         let far_end = node();
         let (listener, address) = far_end.bind().expect("binding");
         let near = std::thread::spawn(move || {
@@ -408,8 +416,12 @@ mod tests {
             "the failed message is collected again, the refused one not"
         );
         assert!(again.origin_uri.ends_with("/INBOX/1"), "by its UID");
-        assert_eq!(after, 0);
-        assert!(served.mailbox.is_empty(), "every one expunged");
+        assert_eq!(after, 0, "the refused one still lies there, unchanged");
+        assert_eq!(
+            served.mailbox,
+            vec![b"two\r\n".to_vec()],
+            "the refused message is the only copy, and is left in the mailbox"
+        );
     }
 
     #[test]

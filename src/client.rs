@@ -19,6 +19,10 @@ pub struct Client {
     writer: TcpStream,
     next_tag: u32,
     selected: Option<String>,
+    /// The `UIDVALIDITY` the selected mailbox announced: while it holds, a
+    /// UID names one message and that message never changes (RFC 3501
+    /// 2.3.1.1).
+    uid_validity: Option<u32>,
 }
 
 impl Client {
@@ -35,6 +39,7 @@ impl Client {
             writer,
             next_tag: 0,
             selected: None,
+            uid_validity: None,
         };
         let greeting = read(&mut client.reader)?;
         if !greeting.is_untagged() || greeting.status() == "BYE" {
@@ -50,16 +55,25 @@ impl Client {
     /// # Errors
     /// Where there is no such mailbox.
     pub fn select(&mut self, mailbox: &str) -> Result<u32> {
-        let mut exists = 0;
+        let (mut exists, mut validity) = (0, None);
         // A SELECT that fails leaves no mailbox selected (RFC 9051 6.3.2).
         self.selected = None;
         self.command(&format!("SELECT {}", quoted(mailbox)), "the select", |r| {
             if let Some((count, "EXISTS")) = r.text.split_once(' ') {
                 exists = count.parse().unwrap_or(0);
             }
+            validity = validity.or_else(|| uid_validity(&r.text));
         })?;
         self.selected = Some(mailbox.to_string());
+        self.uid_validity = validity;
         Ok(exists)
+    }
+
+    /// The `UIDVALIDITY` the selected mailbox announced, `None` where it
+    /// announced none.
+    #[must_use]
+    pub const fn uid_validity(&self) -> Option<u32> {
+        self.uid_validity
     }
 
     /// Select `mailbox` where this session has not already: a session kept
@@ -176,10 +190,31 @@ impl Client {
     }
 }
 
+/// The `n` of a `[UIDVALIDITY n]` response code in `text`.
+fn uid_validity(text: &str) -> Option<u32> {
+    let (_, rest) = text.split_once("[UIDVALIDITY ")?;
+    rest.split_once(']')?.0.trim().parse().ok()
+}
+
 impl Pooled for Client {
     /// While the server has not closed the connection — an autologout
     /// after a long idle closes it.
     fn usable(&mut self) -> bool {
         alive(&self.writer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uid_validity;
+
+    #[test]
+    fn a_select_reads_the_uid_validity_its_mailbox_announced() {
+        assert_eq!(
+            uid_validity("OK [UIDVALIDITY 3857529045] UIDs valid"),
+            Some(3_857_529_045)
+        );
+        assert_eq!(uid_validity("OK [UIDNEXT 4] Predicted next UID"), None);
+        assert_eq!(uid_validity("12 EXISTS"), None);
     }
 }

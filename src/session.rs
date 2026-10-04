@@ -5,6 +5,7 @@
 //! `SEARCH`, `FETCH n BODY[]` (or `BODY.PEEK[]`), `STORE +FLAGS (\Deleted)`,
 //! each by sequence number or by `UID`, `EXPUNGE`, `APPEND`, `NOOP`,
 //! `CAPABILITY`, `LOGOUT` — the commands a collector and a depositor use,
+//! a `SELECT` announcing `UIDVALIDITY 1` (its UIDs are never reused),
 //! and no folder tree, no IDLE, no search grammar: every search answers the
 //! messages not flagged deleted.
 
@@ -37,6 +38,8 @@ pub struct Session {
     deleted: Vec<bool>,
     /// Each message's UID, which an expunge does not renumber.
     uids: Vec<u32>,
+    /// The UID the next append gets: never one given before.
+    next_uid: u32,
     appended: Vec<Taken>,
 }
 
@@ -53,8 +56,10 @@ impl Session {
         let (stream, peer) = socket::accept_tcp(listener, timeout)?;
         let (reader, writer) = socket::split(stream)?;
         let deleted = vec![false; mailbox.len()];
-        let uids = (1..=u32::try_from(mailbox.len()).unwrap_or(u32::MAX)).collect();
+        let held = u32::try_from(mailbox.len()).unwrap_or(u32::MAX);
+        let uids = (1..=held).collect();
         let mut session = Self {
+            next_uid: held.saturating_add(1),
             reader,
             writer,
             peer: peer.to_string(),
@@ -131,6 +136,8 @@ impl Session {
                 "SELECT" | "EXAMINE" => {
                     let count = self.deleted.iter().filter(|d| !**d).count();
                     self.write(format!("* {count} EXISTS\r\n").as_bytes())?;
+                    // One mailbox whose UIDs are never reused.
+                    self.write(b"* OK [UIDVALIDITY 1] UIDs valid\r\n")?;
                     self.ok(&tag, "selected")?;
                 }
                 "SEARCH" => {
@@ -204,8 +211,8 @@ impl Session {
         wire::line(&mut self.reader)?;
         self.mailbox.push(message.clone());
         self.deleted.push(false);
-        let uid = self.uids.last().map_or(1, |last| last + 1);
-        self.uids.push(uid);
+        self.uids.push(self.next_uid);
+        self.next_uid = self.next_uid.saturating_add(1);
         let origin = format!("imap://{}/INBOX/{}", self.peer, self.mailbox.len());
         self.appended.push(Taken::new(origin, message));
         self.ok(tag, "appended")
