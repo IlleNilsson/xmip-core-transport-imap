@@ -37,6 +37,7 @@ pub use client::Client;
 pub use connection::{Connection, RefusedMail};
 use net::Target;
 pub use session::{Served, Session};
+use transport::ArrivalIdentity;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
@@ -261,6 +262,12 @@ impl Accepting for ImapTransport {
 }
 
 impl Loopback for ImapTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "a mail names its sender in itself, a message identity; the peer is the server",
+        )
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }

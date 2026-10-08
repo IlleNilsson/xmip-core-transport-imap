@@ -96,7 +96,7 @@ impl Connection {
                 let connection = self.clone();
                 let body = fetched(move || connection.with(|client| client.fetch(uid)));
                 let told = refused.remembering(uid, validity, acknowledgement);
-                Arrived::new(origin(uid), body, told)
+                Arrived::new(origin(uid), body, told).detected()
             })
             .collect()
     }
