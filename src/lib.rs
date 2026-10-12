@@ -145,6 +145,10 @@ impl Transport for ImapTransport {
         transport::Arrivals::Ordered("a receive searches again what is not yet told")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a search of the mailbox returns at once")
+    }
+
     /// Every message in the mailbox not flagged deleted, searched on the
     /// session kept for the server — logged in and the mailbox selected on
     /// the first receive — and handed back unread: each is fetched whole
