@@ -504,7 +504,7 @@ mod tests {
             .expect("a new session")
             .serve()
             .expect("serving");
-        assert!(served.appended.is_empty());
+        assert_eq!(served.appended, [] as [Taken; 0]);
         let (arrived, opened) = receiver.join().expect("thread").expect("collected");
         assert!(arrived.is_empty());
         assert_eq!(opened, 2);
