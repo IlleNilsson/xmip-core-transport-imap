@@ -158,7 +158,7 @@ impl Transport for ImapTransport {
     /// there unchanged, `Failed` leaves it as it was, and the receive's
     /// flagged messages are expunged once every one has its verdict
     /// ([`connection`]).
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         self.sessions.exchange(
             self.server.as_str(),
             || self.connect().map(Connection::new),
@@ -169,14 +169,20 @@ impl Transport for ImapTransport {
                 })?;
                 let origin = |uid| format!("imap://{}/{}/{uid}", self.server, self.mailbox);
                 let delete = self.delete_after_fetch;
+                let uids = uids.into_iter().take(most).collect();
                 Ok(connection.arrivals(uids, origin, delete, &self.refused))
             },
         )
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("an APPEND carries the message as one literal")
+    }
+
     /// APPEND on the session kept for the server, logged in on the first
     /// send to it.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         let (server, mailbox) = self.resolve(target);
         self.sessions.exchange(
             server,
