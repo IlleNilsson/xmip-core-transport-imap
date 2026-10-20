@@ -16,7 +16,7 @@
 //! where people read it. Either may instead accept clients directly through
 //! [`Session`], one client's worth of server over one mailbox.
 //!
-//! IMAP has artefacts and no locking, so [`Transport::claims`] answers
+//! IMAP has artifacts and no locking, so [`Transport::claims`] answers
 //! [`NoNativeClaim`], ADR-0024 clause 5: two collectors on one mailbox both
 //! see a message until one expunges it, and the Journey's own dedup is what
 //! keeps that honest. RFC 3501; IDLE, folders beyond the one selected, and
