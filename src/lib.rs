@@ -12,13 +12,13 @@
 //! message of the receive has its verdict ([`connection`]). A refused
 //! message is left in the mailbox, and this Location does not collect it
 //! again while it lies there unchanged; a Send Location appends a
-//! message to a mailbox, which is how a Journey files what it concluded
+//! message to a mailbox, which is how Xmip files what a Message concluded
 //! where people read it. Either may instead accept clients directly through
 //! [`Session`], one client's worth of server over one mailbox.
 //!
 //! IMAP has artifacts and no locking, so [`Transport::claims`] answers
 //! [`NoNativeClaim`], ADR-0024 clause 5: two collectors on one mailbox both
-//! see a message until one expunges it, and the Journey's own dedup is what
+//! see a message until one expunges it, and the Journey identifier's dedup is what
 //! keeps that honest. RFC 3501; IDLE, folders beyond the one selected, and
 //! TLS are the next layers.
 //!
