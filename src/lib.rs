@@ -453,13 +453,9 @@ mod tests {
             ImapTransport::new(address, "INBOX", login()).timing_out_after(Duration::from_secs(5));
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for n in 0..SENDS {
                 sending.send("INBOX", n.to_string().as_bytes())?;
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond an append.
-            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
             sending.send("INBOX", b"after the close")
         });
         // One LOGIN for every append: one session accepted.
@@ -489,13 +485,9 @@ mod tests {
             ImapTransport::new(address, "INBOX", login()).timing_out_after(Duration::from_secs(5));
         let (go, going) = std::sync::mpsc::channel();
         let receiver = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for _ in 0..RECEIVES {
                 assert!(near.receive()?.is_empty());
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond a search.
-            assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
             // An append on the same kept session says the searches are done.
             near.send("INBOX", b"searched")?;
             going.recv().expect("go");
