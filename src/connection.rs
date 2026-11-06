@@ -16,7 +16,8 @@
 //! session is locked for one command and its response, so an append on the
 //! same session goes between two.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use xcore::lock::Locked;
 
 use transport::body::fetched;
 use transport::error::Result;
@@ -42,7 +43,7 @@ impl Connection {
     }
 
     fn client(&self) -> MutexGuard<'_, Client> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.locked()
     }
 
     /// Run `act` on the session: one command and its response, or a few.
