@@ -2,7 +2,7 @@
 
 IMAP transport: one message is one Stream, its number in the mailbox beside it; a Location fetches and expunges, or appends, or accepts clients directly. RFC 3501. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
-A Send Location appends on a session logged in once per server and kept (`transport::Pool`); the login is the transport capability's `Login`. `Session::next_append` serves a depositor that keeps its session. Until 2026-09-27 every append logged in and out.
+A Send Location appends on a session logged in once per server and kept (`transport::Pool`); the login is the transport capability's `Login`: the `user` setting with the password the Location's secret holds (`secret = "<name>"`, set with `Set-XmipSecret`), never a setting, and an empty password where it names none. The secret is read as each session logs in (`transport::secured::logged_in`), so one set or replaced reaches the next session and never a kept one. A user or password a quoted string cannot carry — outside ASCII, or holding a quote, a backslash or a control character — goes as a literal, its bytes sent only once the server's `+` continuation asked for them (RFC 3501 7.5). `Session::next_append` serves a depositor that keeps its session. Until 2026-09-27 every append logged in and out.
 
 A Receive Location collects on the same kept session, its mailbox selected once (`Client::selecting`): a search in a selected mailbox sees what arrived since. Until 2026-09-28 every receive logged in, selected and logged out.
 

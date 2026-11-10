@@ -55,7 +55,13 @@ const DELETE_AFTER_FETCH: bool = true;
 pub struct ImapTransport {
     server: String,
     mailbox: String,
+    /// Who it logs in as, and the password it presents where its Location
+    /// names no secret; where it names one, the secret's password replaces
+    /// it at each login ([`transport::secured::logged_in`]).
     login: Login,
+    /// The secret its Location names, whose password the login presents,
+    /// read at each login (ADR-0019, amendment 2026-10-29).
+    secret: Option<transport::Secured>,
     delete_after_fetch: bool,
     timeout: Option<Duration>,
     /// The sessions a send appends on and a receive collects on, logged in
@@ -68,13 +74,16 @@ pub struct ImapTransport {
 }
 
 impl ImapTransport {
-    /// Collect from, and append to, `mailbox` at `server` as `login`.
+    /// Collect from, and append to, `mailbox` at `server` as `login`, its
+    /// password the Location's secret once one is named
+    /// ([`Configured::secured_by`]).
     #[must_use]
     pub fn new(server: impl Into<String>, mailbox: &str, login: Login) -> Self {
         Self {
             server: server.into(),
             mailbox: mailbox.to_string(),
             login,
+            secret: None,
             delete_after_fetch: DELETE_AFTER_FETCH,
             timeout: None,
             sessions: Pool::new(),
@@ -99,9 +108,18 @@ impl ImapTransport {
     /// Connect and log in.
     ///
     /// # Errors
-    /// Where the server could not be reached or refused the login.
+    /// Where the Location's secret could not be read, or the server could
+    /// not be reached or refused the login.
     pub fn connect(&self) -> Result<Client> {
-        Client::connect(&self.server, &self.login, self.timeout)
+        self.connect_to(&self.server)
+    }
+
+    /// Connect to `server` and log in, the password the Location's secret
+    /// holds read now where it names one: each new session reads it, a
+    /// kept one never again.
+    fn connect_to(&self, server: &str) -> Result<Client> {
+        let login = transport::secured::logged_in(&self.login, self.secret.as_ref(), "imap")?;
+        Client::connect(server, &login, self.timeout)
     }
 
     /// Bind as the far end clients connect to, and report the address.
@@ -186,7 +204,7 @@ impl Transport for ImapTransport {
         let (server, mailbox) = self.resolve(target);
         self.sessions.exchange(
             server,
-            || Client::connect(server, &self.login, self.timeout).map(Connection::new),
+            || self.connect_to(server).map(Connection::new),
             |connection| connection.with(|client| client.append(mailbox, bytes)),
         )
     }
@@ -213,7 +231,8 @@ impl Configured for ImapTransport {
                 name: "user",
                 kind: Kind::Text,
                 presence: Presence::Required,
-                meaning: "The user a Location logs in as.",
+                meaning: "The user a Location logs in as; its password is the Location's \
+                          secret.",
                 applies: Applies::Both,
             },
             Setting {
@@ -237,8 +256,8 @@ impl Configured for ImapTransport {
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["imap"];
 
-    /// The password comes through the Location's credentials, never a
-    /// setting; the login is built without it.
+    /// The password is the Location's secret, never a setting; the login is
+    /// built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let login = Login::new(settings.text("user"), "");
         let mut transport = Self::new(address, settings.text("mailbox"), login);
@@ -249,6 +268,12 @@ impl Configured for ImapTransport {
             transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
+    }
+
+    /// The password the Location's secret holds, read at each login.
+    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
+        self.secret = Some(secret);
+        Ok(self)
     }
 }
 
@@ -285,9 +310,13 @@ impl Loopback for ImapTransport {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
+    /// A near end of its own at `address`, logging in as this one does.
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
-        Self::new(address, &self.mailbox, self.login.clone())
-            .timing_out_after(LOOPBACK_TIMEOUT)
+        let near = Self {
+            secret: self.secret.clone(),
+            ..Self::new(address, &self.mailbox, self.login.clone())
+        };
+        near.timing_out_after(LOOPBACK_TIMEOUT)
             .send(&self.mailbox, payload)
     }
 }
@@ -315,8 +344,8 @@ mod tests {
         assert_eq!(built.mailbox, "INBOX");
         assert_eq!(built.login.user, "orders");
         assert!(
-            built.login.password.is_empty(),
-            "the password is the credentials'"
+            built.login.password.is_empty() && built.secret.is_none(),
+            "the password is the Location's secret, none named here"
         );
         assert!(!built.delete_after_fetch);
         let Err(refused) = ImapTransport::open("mail.example:143", Applies::Send, &given[..1])
@@ -553,5 +582,152 @@ mod tests {
         };
         assert!(!error.retryable);
         assert!(error.message.contains("AUTHENTICATIONFAILED"));
+    }
+
+    /// The `LOGIN` line the next client on `listener` sends, as the server
+    /// received it, the login refused once read.
+    fn login_offered(listener: &TcpListener) -> std::thread::JoinHandle<String> {
+        let listener = listener.try_clone().expect("listener");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut writer = stream;
+            std::io::Write::write_all(&mut writer, b"* OK hi\r\n").expect("greet");
+            let login = wire::line(&mut reader).expect("LOGIN");
+            std::io::Write::write_all(&mut writer, b"X1 NO [AUTHENTICATIONFAILED] read\r\n")
+                .expect("refuse");
+            login
+        })
+    }
+
+    /// What `act` presented to a far end that refuses every login.
+    fn presented(
+        listener: &TcpListener,
+        act: impl FnOnce() -> Option<transport::TransportError>,
+    ) -> String {
+        let far_end = login_offered(listener);
+        let refused = act().expect("refused by the far end");
+        assert!(
+            refused.message.contains("AUTHENTICATIONFAILED"),
+            "{refused}"
+        );
+        far_end.join().expect("far end")
+    }
+
+    #[test]
+    fn the_password_is_the_locations_secret_read_at_each_login() {
+        use transport::secured::Kept;
+        let kept = std::sync::Arc::new(Kept::default());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let plain = ImapTransport::new(address.clone(), "INBOX", Login::new("orders", "plain"))
+            .timing_out_after(Duration::from_secs(2));
+        assert_eq!(
+            presented(&listener, || plain.connect().err()),
+            "X1 LOGIN \"orders\" \"plain\"",
+            "no secret named: the login as it was given"
+        );
+
+        let near = plain
+            .secured_by(kept.secured("partner-x.imap"))
+            .expect("kept");
+        // Read before any connection opens: the near end a loopback sends
+        // from carries the secret too, and no far end listens at port 9.
+        let unset = [
+            near.connect().err(),
+            near.receive().err(),
+            near.send("INBOX", b"UNA").err(),
+            near.send_to("127.0.0.1:9", b"UNA").err(),
+        ];
+        for refused in unset {
+            let refused = refused.expect("not set");
+            assert!(
+                refused.message.contains("'partner-x.imap' is not set"),
+                "{refused}"
+            );
+            assert!(!refused.retryable);
+        }
+
+        kept.set(
+            "partner-x.imap",
+            xcore::SecretKind::Key,
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        );
+        let wrong = near.connect().err().expect("a key");
+        assert!(
+            wrong
+                .message
+                .contains("is a key, and imap presents a password"),
+            "{wrong}"
+        );
+
+        let drawn = Kept::drawn();
+        kept.set("partner-x.imap", xcore::SecretKind::Password, &drawn);
+        let expected = format!("X1 LOGIN \"orders\" \"{drawn}\"");
+        assert_eq!(presented(&listener, || near.receive().err()), expected);
+        assert_eq!(
+            presented(&listener, || near.send("INBOX", b"UNA").err()),
+            expected
+        );
+
+        let replaced = format!("{}-next", Kept::drawn());
+        kept.set("partner-x.imap", xcore::SecretKind::Password, &replaced);
+        assert_eq!(
+            presented(&listener, || near.send("INBOX", b"UNA").err()),
+            format!("X1 LOGIN \"orders\" \"{replaced}\""),
+            "a secret replaced reaches the next connection"
+        );
+    }
+
+    #[test]
+    fn a_kept_session_reads_the_secret_no_more_and_a_new_one_reads_it_again() {
+        use transport::secured::Kept;
+        let kept = std::sync::Arc::new(Kept::default());
+        kept.set(
+            "partner-x.imap",
+            xcore::SecretKind::Password,
+            &Kept::drawn(),
+        );
+        let far_end = node();
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = ImapTransport::new(address, "INBOX", Login::new("orders", ""))
+            .timing_out_after(Duration::from_secs(2))
+            .secured_by(kept.secured("partner-x.imap"))
+            .expect("kept");
+        let sending = near.clone();
+        let (go, going) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            sending.send("INBOX", b"first")?;
+            // No password now: read again, it would refuse the next append.
+            kept.set(
+                "partner-x.imap",
+                xcore::SecretKind::Key,
+                "-----BEGIN OPENSSH PRIVATE KEY-----",
+            );
+            sending.send("INBOX", b"second")?;
+            going.recv().expect("go");
+            Ok::<_, transport::TransportError>(sending.send("INBOX", b"third").err())
+        });
+        let mut session = far_end
+            .accept_one(&listener, Vec::new())
+            .expect("accepting");
+        for expected in [&b"first"[..], b"second"] {
+            let appended = session.next_append().expect("append").expect("one");
+            assert_eq!(appended.bytes, expected);
+        }
+        drop(session);
+        go.send(()).expect("went");
+        let refused = sender
+            .join()
+            .expect("thread")
+            .expect("both appended on the kept session")
+            .expect("the new session read the secret");
+        assert!(
+            refused
+                .message
+                .contains("is a key, and imap presents a password"),
+            "{refused}"
+        );
+        assert_eq!(near.sessions.opened(), 1);
     }
 }
