@@ -1,5 +1,6 @@
 //! RFC 3501 on the wire: tagged commands, untagged `*` responses, the `+`
-//! continuation, and the `{n}` literal that carries a message body.
+//! continuation, and the `{n}` literal that carries a message body or an
+//! argument a quoted string cannot.
 
 use std::io::BufRead;
 
@@ -122,16 +123,30 @@ pub fn until_tagged(
     }
 }
 
-/// `text` as an IMAP quoted string, or a literal where it cannot be quoted.
-#[must_use]
-pub fn quoted(text: &str) -> String {
-    if text
-        .chars()
-        .all(|c| c != '"' && c != '\\' && c != '\r' && c != '\n' && !c.is_control())
-    {
-        format!("\"{text}\"")
-    } else {
-        format!("{{{}}}\r\n{text}", text.len())
+/// One argument as a command carries it (RFC 3501 4.3 and 4.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Argument<'a> {
+    /// `"text"`: seven-bit, no quote, backslash or control character.
+    Quoted(&'a str),
+    /// `{n}`, CRLF, then the `n` bytes, sent only once the server's `+`
+    /// continuation asked for them (RFC 3501 7.5).
+    Literal(&'a [u8]),
+}
+
+impl<'a> Argument<'a> {
+    /// `text` quoted where a quoted string can carry it, a literal where it
+    /// cannot: a quoted string is seven-bit (RFC 3501 9, `CHAR`), so text
+    /// outside ASCII — a password secret is any UTF-8 — goes as a literal.
+    #[must_use]
+    pub fn of(text: &'a str) -> Self {
+        if text
+            .chars()
+            .all(|c| c.is_ascii() && c != '"' && c != '\\' && !c.is_ascii_control())
+        {
+            Self::Quoted(text)
+        } else {
+            Self::Literal(text.as_bytes())
+        }
     }
 }
 
@@ -168,7 +183,18 @@ mod tests {
         let refused =
             until_tagged(&mut &b"A3 NO nope\r\n"[..], "A3", "it", |_| {}).expect_err("no");
         assert!(!refused.retryable);
-        assert_eq!(quoted("plain"), "\"plain\"");
-        assert_eq!(quoted("a\"b"), "{3}\r\na\"b");
+    }
+
+    #[test]
+    fn an_argument_is_quoted_where_it_can_be_and_a_literal_where_not() {
+        assert_eq!(Argument::of("plain"), Argument::Quoted("plain"));
+        assert_eq!(Argument::of(""), Argument::Quoted(""));
+        for text in ["a\"b", "a\\b", "a\r\nb", "a\tb", "pässord", "\u{1F511}"] {
+            assert_eq!(
+                Argument::of(text),
+                Argument::Literal(text.as_bytes()),
+                "{text}"
+            );
+        }
     }
 }
