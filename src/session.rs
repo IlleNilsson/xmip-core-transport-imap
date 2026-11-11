@@ -202,8 +202,24 @@ impl Session {
         }
     }
 
+    /// The mailbox an APPEND names first (RFC 3501 6.3.11) — a quoted
+    /// string or an atom on the line, or a literal asked for and read in —
+    /// then the message, the literal its line ends with; flags and a date
+    /// between them are left alone. The one mailbox served holds it, and
+    /// its origin says where it was put.
     fn append(&mut self, tag: &str, argument: &str) -> Result<()> {
-        let Some(length) = wire::literal_length(argument)? else {
+        let (named, rest) = if let Some((named, rest)) = wire::astring(argument) {
+            (named, rest.to_string())
+        } else {
+            let Some(length) = wire::literal_length(argument)? else {
+                return self.no(tag, "append needs a mailbox");
+            };
+            self.write(b"+ go ahead\r\n")?;
+            let named = String::from_utf8(wire::read_literal(&mut self.reader, length)?)
+                .map_err(|_| protocol_error("a mailbox that is not UTF-8"))?;
+            (named, wire::line(&mut self.reader)?)
+        };
+        let Some(length) = wire::literal_length(&rest)? else {
             return self.no(tag, "append needs a literal");
         };
         self.write(b"+ go ahead\r\n")?;
@@ -213,7 +229,7 @@ impl Session {
         self.deleted.push(false);
         self.uids.push(self.next_uid);
         self.next_uid = self.next_uid.saturating_add(1);
-        let origin = format!("imap://{}/INBOX/{}", self.peer, self.mailbox.len());
+        let origin = format!("imap://{}/{named}/{}", self.peer, self.mailbox.len());
         self.appended.push(Taken::new(origin, message));
         self.ok(tag, "appended")
     }

@@ -38,6 +38,7 @@ pub use connection::{Connection, RefusedMail};
 use net::Target;
 pub use session::{Served, Session};
 use transport::ArrivalIdentity;
+use transport::destination;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
@@ -140,13 +141,11 @@ impl ImapTransport {
 
     /// Where a target names the server and mailbox itself —
     /// `imap://host:143/INBOX` — or is a mailbox alone on this transport's
-    /// server.
+    /// server, or empty and this transport's mailbox
+    /// (`transport::destination::on_server`).
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match Target::under(Self::SCHEMES, target).map(|named| (named.authority(), named.path())) {
-            Some((peer, "")) => (peer, &self.mailbox),
-            Some(pair) => pair,
-            None => (&self.server, target),
-        }
+        let named = Target::under(Self::SCHEMES, target);
+        destination::on_server(target, named, (&self.server, &self.mailbox))
     }
 }
 
@@ -256,6 +255,11 @@ impl Configured for ImapTransport {
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["imap"];
 
+    /// The mailbox setting: the address names only the server.
+    fn own_target(_address: &str) -> &str {
+        destination::OWN
+    }
+
     /// The password is the Location's secret, never a setting; the login is
     /// built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
@@ -360,6 +364,42 @@ mod tests {
     }
 
     #[test]
+    fn a_send_location_appends_to_its_mailbox_and_a_target_naming_another_wins() {
+        use xcore::settings::Given;
+        let far_end = node();
+        let (listener, address) = far_end.bind().expect("binding");
+        let location = format!("imap://{address}");
+        let near = std::thread::spawn(move || {
+            let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+            let given = [
+                text("mailbox", "Outbox"),
+                text("user", "orders"),
+                text("timeout", "2s"),
+            ];
+            let near = ImapTransport::open(&location, Applies::Send, &given)?;
+            near.send(ImapTransport::own_target(&location), b"own")?;
+            near.send("Sent", b"other")?;
+            // A quote cannot be quoted: the mailbox goes as a literal.
+            near.send("Out\"box", b"literal")
+        });
+        let mut session = far_end
+            .accept_one(&listener, Vec::new())
+            .expect("accepting");
+        let own = session.next_append().expect("own").expect("appended");
+        assert!(own.origin_uri.contains("/Outbox/"), "{}", own.origin_uri);
+        let other = session.next_append().expect("other").expect("appended");
+        assert!(other.origin_uri.contains("/Sent/"), "{}", other.origin_uri);
+        let literal = session.next_append().expect("literal").expect("appended");
+        assert!(
+            literal.origin_uri.contains("/Out\"box/"),
+            "{}",
+            literal.origin_uri
+        );
+        assert_eq!(literal.bytes, b"literal");
+        near.join().expect("thread").expect("appending");
+    }
+
+    #[test]
     fn the_loopback_appends_one_message_and_takes_it() {
         let message = b"Subject: y\n\n{3}";
         let arrived = ImapTransport::loopback().round(message).expect("round");
@@ -414,7 +454,7 @@ mod tests {
         assert_eq!(served.mailbox.len(), 1, "the two collected expunged");
         assert_eq!(served.appended.len(), 1);
         assert_eq!(served.appended[0].bytes, b"Subject: filed\r\n\r\nbody\r\n");
-        assert!(served.appended[0].origin_uri.ends_with("/INBOX/1"));
+        assert!(served.appended[0].origin_uri.ends_with("/Sent/1"));
         let collected = near.join().expect("thread").expect("round trip");
         assert_eq!(collected.len(), 2);
         assert_eq!(collected[0].bytes, mailbox[0]);

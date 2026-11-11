@@ -12,6 +12,8 @@ A message is consumed only after the runtime's whole receive cycle. A receive se
 
 A send target is read by `net::Target` in [xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net), the one reading of a URI every technology calls: scheme, authority, path and decoded query. Until 2026-09-28 it was read through the transport capability's `socket::target`, which split it on its first slash and left the query in the path.
 
+A Send Location appends to the mailbox its `mailbox` setting names, on the server its address names: it sends to the empty target (`Configured::own_target`, `transport::destination::OWN`), which `transport::destination::on_server` reads as that mailbox. A target naming another still wins — `Sent`, or `imap://host:143/Sent` (ADR-0064, amendment 2026-11-10). The far end (`session.rs`) records each append under the mailbox its `APPEND` names first, read as RFC 3501 writes one: a quoted string with its escapes read or an atom (`wire::astring`), or a literal it asks for and reads in, as the client sends a mailbox a quoted string cannot carry; flags and a date after it are left alone.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it

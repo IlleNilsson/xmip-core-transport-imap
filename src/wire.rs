@@ -123,6 +123,29 @@ pub fn until_tagged(
     }
 }
 
+/// The astring `text` opens with (RFC 3501 9) — a quoted string, its
+/// escapes read, or an atom — and what follows it. `None` where it opens
+/// with neither: a literal, which only the connection can read, or nothing.
+#[must_use]
+pub fn astring(text: &str) -> Option<(String, &str)> {
+    let Some(quoted) = text.strip_prefix('"') else {
+        let end = text
+            .find(|c: char| "(){ %*\"\\".contains(c) || c.is_ascii_control())
+            .unwrap_or(text.len());
+        return (end > 0).then(|| (text[..end].to_string(), &text[end..]));
+    };
+    let mut read = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '"' => return Some((read, &quoted[at + 1..])),
+            '\\' => read.push(chars.next()?.1),
+            c => read.push(c),
+        }
+    }
+    None
+}
+
 /// One argument as a command carries it (RFC 3501 4.3 and 4.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Argument<'a> {
@@ -183,6 +206,21 @@ mod tests {
         let refused =
             until_tagged(&mut &b"A3 NO nope\r\n"[..], "A3", "it", |_| {}).expect_err("no");
         assert!(!refused.retryable);
+    }
+
+    #[test]
+    fn an_astring_is_read_quoted_or_as_an_atom_and_what_follows_is_left() {
+        let flagged = "\"Outbox\" (\\Seen) \"10-Nov-2026 21:58:00 +0100\" {3}";
+        let (mailbox, rest) = astring(flagged).expect("quoted");
+        assert_eq!(mailbox, "Outbox");
+        assert_eq!(rest, " (\\Seen) \"10-Nov-2026 21:58:00 +0100\" {3}");
+        let (mailbox, rest) = astring("\"Out \\\"box\\\\\" {3}").expect("escaped");
+        assert_eq!((mailbox.as_str(), rest), ("Out \"box\\", " {3}"));
+        let (mailbox, rest) = astring("Sent/2026] {3}").expect("an atom");
+        assert_eq!((mailbox.as_str(), rest), ("Sent/2026]", " {3}"));
+        for none in ["{6}", "", " Outbox", "\"unterminated", "\"cut \\"] {
+            assert_eq!(astring(none), None, "{none:?}");
+        }
     }
 
     #[test]
