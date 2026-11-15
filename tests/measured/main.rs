@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use transport::Configured;
 use transport::{Login, Transport};
 use xcore::latency::Rounds;
 use xmip_core_transport_imap::ImapTransport;
