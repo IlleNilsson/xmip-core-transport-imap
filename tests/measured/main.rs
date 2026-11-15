@@ -9,11 +9,23 @@
 //! - a thousand appends on one session take a millisecond each at most;
 //! - a thousand receives on one session take a millisecond a search at
 //!   most.
+//!
+//! Each the millisecond beyond the round's wakes, round by round beside a
+//! plain wake, the fastest of five (`xcore::latency::Rounds`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use transport::{Login, Transport};
+use xcore::latency::Rounds;
 use xmip_core_transport_imap::ImapTransport;
+
+/// What an append wakes where a plain wake wakes one: the far end and this
+/// end at the APPEND and its continuation, and again at the literal and
+/// its tagged OK.
+const SEND_WAKES: u32 = 4;
+
+/// What a search wakes: the far end at it, and this end at its answer.
+const RECEIVE_WAKES: u32 = 2;
 
 fn login() -> Login {
     Login::new("orders", "se\"cret")
@@ -34,14 +46,11 @@ fn a_thousand_appends_take_a_millisecond_each_at_most() {
     const SENDS: usize = 1000;
     let (far_end, listener, near) = ends();
     let sender = std::thread::spawn(move || {
-        let began = Instant::now();
+        let mut rounds = Rounds::crossing(SEND_WAKES);
         for n in 0..SENDS {
-            near.send("INBOX", n.to_string().as_bytes())?;
+            rounds.round(|| near.send("INBOX", n.to_string().as_bytes()))?;
         }
-        let took = began.elapsed();
-        // Generous for a debug build under load: a millisecond an append.
-        assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
-        Ok::<_, transport::TransportError>(())
+        Ok::<_, transport::TransportError>(rounds)
     });
     let mut session = far_end
         .accept_one(&listener, Vec::new())
@@ -50,7 +59,8 @@ fn a_thousand_appends_take_a_millisecond_each_at_most() {
         let appended = session.next_append().expect("append").expect("one");
         assert_eq!(appended.bytes, n.to_string().as_bytes());
     }
-    sender.join().expect("thread").expect("sending");
+    let rounds = sender.join().expect("thread").expect("sending");
+    rounds.hold("an append");
 }
 
 #[test]
@@ -58,14 +68,11 @@ fn a_thousand_receives_take_a_millisecond_a_search_at_most() {
     const RECEIVES: usize = 1000;
     let (far_end, listener, near) = ends();
     let receiver = std::thread::spawn(move || {
-        let began = Instant::now();
+        let mut rounds = Rounds::crossing(RECEIVE_WAKES);
         for _ in 0..RECEIVES {
-            assert!(near.receive()?.is_empty());
+            assert!(rounds.round(|| near.receive())?.is_empty());
         }
-        let took = began.elapsed();
-        // Generous for a debug build under load: a millisecond a search.
-        assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
-        Ok::<_, transport::TransportError>(())
+        Ok::<_, transport::TransportError>(rounds)
     });
     // Served until the near end lets its session go.
     far_end
@@ -73,5 +80,6 @@ fn a_thousand_receives_take_a_millisecond_a_search_at_most() {
         .expect("accepting")
         .serve()
         .expect("serving");
-    receiver.join().expect("thread").expect("collected");
+    let rounds = receiver.join().expect("thread").expect("collected");
+    rounds.hold("a receive, a search");
 }
