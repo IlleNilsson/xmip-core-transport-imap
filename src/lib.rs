@@ -99,13 +99,6 @@ impl ImapTransport {
         self
     }
 
-    /// Give up on a server that stops mid-response.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// Connect and log in.
     ///
     /// # Errors
@@ -241,14 +234,12 @@ impl Configured for ImapTransport {
                 meaning: "Whether a message is deleted once its receive cycle accepted it.",
                 applies: Applies::Receive,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a server that stops mid-response is waited on; unbounded \
-                          when left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a server that stops mid-response is waited on; unbounded \
+                 when left out.",
+            ),
         ],
     };
 
@@ -260,6 +251,10 @@ impl Configured for ImapTransport {
         destination::OWN
     }
 
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
+
     /// The password is the Location's secret, never a setting; the login is
     /// built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
@@ -267,9 +262,6 @@ impl Configured for ImapTransport {
         let mut transport = Self::new(address, settings.text("mailbox"), login);
         if settings.optional_boolean("delete_after_fetch") == Some(false) {
             transport = transport.leaving_mail();
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
     }
