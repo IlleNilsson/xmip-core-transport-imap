@@ -677,7 +677,7 @@ mod tests {
                 refused.message.contains("'partner-x.imap' is not set"),
                 "{refused}"
             );
-            assert!(!refused.retryable);
+            assert!(refused.retryable, "asked again at the next connection");
         }
 
         kept.set(
