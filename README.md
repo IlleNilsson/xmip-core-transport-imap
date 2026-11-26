@@ -14,6 +14,10 @@ A send target is read by `net::Target` in [xmip-core-library-net](https://github
 
 A Send Location appends to the mailbox its `mailbox` setting names, on the server its address names: it sends to the empty target (`Configured::own_target`, `transport::destination::OWN`), which `transport::destination::on_server` reads as that mailbox. A target naming another still wins — `Sent`, or `imap://host:143/Sent` (ADR-0064, amendment 2026-11-10). The far end (`session.rs`) records each append under the mailbox its `APPEND` names first, read as RFC 3501 writes one: a quoted string with its escapes read or an atom (`wire::astring`), or a literal it asks for and reads in, as the client sends a mailbox a quoted string cannot carry; flags and a date after it are left alone.
 
+## The declaration
+
+What a Location of this technology is configured with is two `const`s in its `declaration` module, `src/declaration.rs`, beside the code, which `Configured` reads (ADR-0064, amendment 2026-11-26): `declaration::SETTINGS`, `mailbox`, `user`, `delete_after_fetch` and `timeout`, and `SCHEMES`, `imap`; `delete_after_fetch`'s default, `declaration::DELETE_AFTER_FETCH`, is declared there too, and a transport takes it from there. Built with its `declaration` feature alone (`--no-default-features --features declaration`), the crate is those and nothing more: its code and every crate the code is built on are behind the default feature. So the library the surfaces load can carry it without the code, for the language server and the desktop to suggest and check an IMAP Location's settings though no node in their process loaded the technology, once the gathering crate of open problem 48 links it. `test/Declaration.Test.ps1` in the estate holds that the declaration builds nothing the transport capability does not.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it

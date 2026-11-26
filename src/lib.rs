@@ -24,34 +24,52 @@
 //!
 //! The origin URI carries what the server knew, the message's UID last:
 //! `imap://server/INBOX/3`.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "default")]
 pub mod connection;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod session;
+#[cfg(feature = "default")]
 pub mod wire;
 
-use std::net::TcpListener;
-use std::time::Duration;
+#[cfg(feature = "default")]
+use std::{net::TcpListener, time::Duration};
 
+#[cfg(feature = "default")]
 pub use client::Client;
+#[cfg(feature = "default")]
 pub use connection::{Connection, RefusedMail};
+#[cfg(feature = "default")]
+use declaration::DELETE_AFTER_FETCH;
+#[cfg(feature = "default")]
 use net::Target;
+#[cfg(feature = "default")]
 pub use session::{Served, Session};
-use transport::ArrivalIdentity;
-use transport::destination;
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
+#[cfg(feature = "default")]
 use transport::listening::{Accepting, Listening};
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
-use transport::taken::Taken;
+#[cfg(feature = "default")]
+use transport::{ArrivalIdentity, destination, socket, taken::Taken};
+#[cfg(feature = "default")]
 use transport::{
     Arrived, Configured, Directions, Login, NoNativeClaim, Pool, ResourceClaim, Transport,
 };
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
-/// Whether an accepted message is deleted, unless a Location says.
-const DELETE_AFTER_FETCH: bool = true;
-
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct ImapTransport {
     server: String,
@@ -74,6 +92,7 @@ pub struct ImapTransport {
     refused: RefusedMail,
 }
 
+#[cfg(feature = "default")]
 impl ImapTransport {
     /// Collect from, and append to, `mailbox` at `server` as `login`, its
     /// password the Location's secret once one is named
@@ -142,6 +161,7 @@ impl ImapTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for ImapTransport {
     fn name(&self) -> &'static str {
         "imap"
@@ -206,45 +226,10 @@ impl Transport for ImapTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for ImapTransport {
-    /// The address is the server's host and port: where a Location logs in.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "mailbox",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The mailbox a Location collects from, or appends to unless the \
-                          target names another.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "user",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The user a Location logs in as; its password is the Location's \
-                          secret.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "delete_after_fetch",
-                kind: Kind::Boolean,
-                presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_FETCH)),
-                meaning: "Whether a message is deleted once its receive cycle accepted it.",
-                applies: Applies::Receive,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a server that stops mid-response is waited on; unbounded \
-                 when left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["imap"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The mailbox setting: the address names only the server.
     fn own_target(_address: &str) -> &str {
@@ -273,6 +258,7 @@ impl Configured for ImapTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl ImapTransport {
     /// Both ends on this machine: an ephemeral local port, an empty INBOX
     /// at the far end, a probe login, the loopback timeout on every read.
@@ -285,6 +271,7 @@ impl ImapTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Accepting for ImapTransport {
     /// The one message the client appends; it keeps its session for the
     /// next.
@@ -295,6 +282,7 @@ impl Accepting for ImapTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for ImapTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
@@ -321,6 +309,7 @@ impl Loopback for ImapTransport {
 mod tests {
     use super::*;
     use transport::payload::edge_payloads;
+    use xcore::settings::Applies;
 
     fn login() -> Login {
         Login::new("orders", "se\"cret")
